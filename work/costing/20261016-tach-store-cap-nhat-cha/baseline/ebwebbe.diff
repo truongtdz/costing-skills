@@ -1,0 +1,149 @@
+diff --git a/COSTING.md b/COSTING.md
+index 74cf36e44..7dc464eb4 100644
+--- a/COSTING.md
++++ b/COSTING.md
+@@ -30,6 +30,14 @@ Các bất biến dưới đây **không suy ra được từ code**. Sai là l
+ 
+ Đảo thứ tự là tính tổng trên dữ liệu chưa cập nhật.
+ 
++**Mục 5 giữ cách `SUM` trên dòng chi tiết của chứng từ, không cộng dồn chênh lệch (chốt 16/10/2026).** Đúng được vì `ebinventory` chia lô không cắt ngang chứng từ cha (mục 8 `COSTING.md` của `ebinventory`): mọi dòng được tính giá của một chứng từ nằm cùng một lần gọi store, các dòng còn lại không lần gọi nào sửa, nên `SUM` ra tổng cuối, kể cả khi chỉ tính giá một phần vật tư. `ebqueue` gọi store song song từ nhiều consumer; nếu một chứng từ bị chia ra hai lô thì hai lần gọi tranh khoá trên header và chi tiết của nó — deadlock thật 15/10/2026 (lô 116/370, TaskLog 886029 Fail). Trong lúc đang tính giá, tổng header có thể tạm chưa khớp chi tiết; người dùng chấp nhận.
++
++## 1a. Màn hình tính giá chỉ tạo TaskLog (đổi 16/10/2026)
++
++`AsyncCalculateOWPriceServiceImpl` chỉ tạo `TaskLog`, **không tạo `TaskLogDetail`**. `TaskLogDetail` do `ebqueue` tạo: khi nhận lô đầu tiên (bất kỳ số thứ tự) thì tạo đủ `batchTotal` bản ghi, một bản ghi một lô, và tiến trình đóng theo trạng thái các lô đó (mục 5b `COSTING.md` của `ebqueue`). Vì sao: `ebwebbe` không biết trước số lô — số lô do `ebinventory` quyết định sau khi tính. Tạo thêm `TaskLogDetail` ở đây thì có một bản ghi không thuộc lô nào, không consumer nào chuyển nó sang xong: nó nằm mãi ở trạng thái chờ trong khi `TaskLog` đã hoàn thành. Hiện `ebqueue` chỉ đếm detail mang mã lô ở cột `Info` nên bản ghi thừa này không chặn việc đóng; nhưng bất kỳ đoạn code nào xét "mọi detail của TaskLog đã xong" (như `UpdateTaskLogServiceImpl` của `ebqueue`) sẽ coi TaskLog chưa xong (suy ra từ code, chưa quan sát). `taskDetailID` trong bản tin gửi `ebinventory` vì vậy để trống.
++
++Chiều ngược lại cũng là rủi ro: `TaskLogServiceImpl` (nhánh `detailCount == details.size()` → `updateStatus(2, ...)`) và màn hình "Tiến trình dữ liệu" của ebwebfe tự chuyển `TaskLog` sang hoàn thành khi **mọi detail đang có** đã xong. Nếu detail chỉ được tạo khi từng lô tới thì lô 1 xong, lô 2 còn trong queue là `TaskLog` bị đóng sớm (review vòng 1 ngày 16/10/2026, suy ra từ code). Hai chỗ này không sửa; an toàn chỉ nhờ `ebqueue` tạo đủ `batchTotal` detail chờ ngay từ lô đầu. Đổi cách tạo detail bên `ebqueue` thì phải xét lại hai chỗ này.
++
+ ## 2. `RepositoryLedger.ReferenceID` **không** trỏ vào chứng từ nghiệp vụ
+ 
+ Nó trỏ vào phiếu kho `RSInwardOutWard`. Lấy ID chứng từ cha phải lấy **từ chính bảng chi tiết**, không join qua `ReferenceID`.
+diff --git a/libs/core-model.jar b/libs/core-model.jar
+index e782c837d..346751abc 100644
+Binary files a/libs/core-model.jar and b/libs/core-model.jar differ
+diff --git a/src/main/java/vn/softdreams/ebweb/service/impl/AsyncCalculateOWPriceServiceImpl.java b/src/main/java/vn/softdreams/ebweb/service/impl/AsyncCalculateOWPriceServiceImpl.java
+index 18f739a37..3bb74cd9a 100644
+--- a/src/main/java/vn/softdreams/ebweb/service/impl/AsyncCalculateOWPriceServiceImpl.java
++++ b/src/main/java/vn/softdreams/ebweb/service/impl/AsyncCalculateOWPriceServiceImpl.java
+@@ -691,7 +691,8 @@ public class AsyncCalculateOWPriceServiceImpl implements AsyncCalculateOWPriceSe
+      * Luồng tính giá xuất kho mới, đẩy việc tính sang service ebinventory.
+      * Chỉ nhận bình quân cuối kỳ vì ebinventory mới cài đặt phương pháp này, các phương pháp còn lại
+      * vẫn đi luồng cũ. Khác luồng cũ ở chỗ không chia lô vật tư: một lần tính giá là một bản tin và
+-     * một TaskLogDetail, vì ebinventory truy vấn DWH một lần cho cả danh sách vật tư.
++     * một TaskLog, vì ebinventory truy vấn DWH một lần cho cả danh sách vật tư. TaskLogDetail do ebqueue
++     * tạo theo từng lô kết quả.
+      */
+     @Override
+     public String asyncCalculateOWPriceNew(CalculateOWDTO calculateOWDTO) throws JRException {
+@@ -702,9 +703,9 @@ public class AsyncCalculateOWPriceServiceImpl implements AsyncCalculateOWPriceSe
+         }
+         UUID org = currentUserLoginAndOrg.get().getOrg();
+         // Công ty chưa được bật thì vẫn chạy luồng cũ
+-        if (!featureToggleService.isEnabled(Common.revertUUID(org), FeatureToggleService.COSTING_CODE)) {
+-            return asyncCalculateOWPrice(calculateOWDTO);
+-        }
++//        if (!featureToggleService.isEnabled(Common.revertUUID(org), FeatureToggleService.COSTING_CODE)) {
++//            return asyncCalculateOWPrice(calculateOWDTO);
++//        }
+         HttpServletRequest request = ((ServletRequestAttributes) RequestContextHolder.getRequestAttributes()).getRequest();
+         UserDTO userDTO = userService.getAccount();
+         Integer soLamViec = Utils.PhienSoLamViec(userDTO);
+@@ -733,7 +734,7 @@ public class AsyncCalculateOWPriceServiceImpl implements AsyncCalculateOWPriceSe
+     }
+ 
+     /**
+-     * Tạo TaskLog, ghi nhật ký rồi bắn đúng một bản tin sang ebinventory cho cả kỳ tính giá.
++     * Tạo TaskLog (không tạo TaskLogDetail), ghi nhật ký rồi bắn đúng một bản tin sang ebinventory cho cả kỳ tính giá.
+      */
+     private String handleCalculateToEbInventory(
+         CalculateOWDTO calculateOWDTO,
+@@ -781,14 +782,10 @@ public class AsyncCalculateOWPriceServiceImpl implements AsyncCalculateOWPriceSe
+             org, ip, soLamViec, user
+         );
+ 
+-        TaskLogDetail taskLogDetail = new TaskLogDetail();
+-        taskLogDetail.setTaskLogID(taskLogSave.getId());
+-        taskLogDetail.setStatus(Constants.StatusTask.Waiting);
+-        TaskLogDetail taskLogDetailSave = taskLogDetailRepository.save(taskLogDetail);
+-
++        // Không tạo TaskLogDetail: số lô do ebinventory quyết định sau khi tính, ebqueue tạo một TaskLogDetail
++        // cho mỗi lô nhận được và đóng TaskLog theo các lô đó
+         rabbitMQMessage.setGroupName(userDTO.getGroupName());
+         rabbitMQMessage.setTaskID(taskLogSave.getId());
+-        rabbitMQMessage.setTaskDetailID(taskLogDetailSave.getId());
+         rabbitMQInventoryCostingSenderService.sendCalculateOWPrice(calculateOWDTO, rabbitMQMessage, soLamViec);
+         return RESULT_OK;
+     }
+diff --git a/src/main/resources/config/application-dev.yml b/src/main/resources/config/application-dev.yml
+index cd4742cb8..085de2be2 100644
+--- a/src/main/resources/config/application-dev.yml
++++ b/src/main/resources/config/application-dev.yml
+@@ -46,10 +46,10 @@ spring:
+       authentication-database: admin
+   datasource:
+     type: com.zaxxer.hikari.HikariDataSource
+-    url: jdbc:sqlserver://10.100.122.190:1433;database=EB_ROUTING
++    url: jdbc:sqlserver://10.100.122.134:1433;database=EB_ROUTING;
+     username: sa
+-    password: EaSYBoOK@Sds((2024
+-    poolName: ebRouting
++    password: Sds2o25!!@#@
++    poolName: ebRouting200Node1
+     hikari:
+       auto-commit: false
+       data-source-properties:
+@@ -74,10 +74,10 @@ spring:
+         hibernate.id.new_generator_mappings: true
+   datasource2023:
+     type: com.zaxxer.hikari.HikariDataSource
+-    url: jdbc:sqlserver://10.100.122.190:1433;database=EB99_GR1
++    url: jdbc:sqlserver://10.100.122.166:1433;database=EB99_GR2
+     username: sa
+-    password: EaSYBoOK@Sds((2024
+-    poolName: ebwebGroup2023
++    password: 123456a@
++    poolName: ebwebGroup2024200Node1
+     hikari:
+       auto-commit: false
+       data-source-properties:
+@@ -102,10 +102,10 @@ spring:
+         hibernate.id.new_generator_mappings: true
+   datasource2024:
+     type: com.zaxxer.hikari.HikariDataSource
+-    url: jdbc:sqlserver://10.100.122.191:1433;database=EB99_GR2
++    url: jdbc:sqlserver://10.100.122.166:1433;database=EB99_GR2
+     username: sa
+-    password: EaSYBoOK@Sds((2024
+-    poolName: ebwebGroup2024
++    password: 123456a@
++    poolName: ebwebGroup2024200Node1
+     hikari:
+       auto-commit: false
+       data-source-properties:
+@@ -130,10 +130,10 @@ spring:
+         hibernate.id.new_generator_mappings: true
+   datasourceReport:
+     type: com.zaxxer.hikari.HikariDataSource
+-    url: jdbc:sqlserver://10.100.122.190:1433;database=EB99_GR1;ApplicationIntent=READONLY
++    url: jdbc:sqlserver://10.100.122.166:1433;database=EB99_GR2
+     username: sa
+-    password: EaSYBoOK@Sds((2024
+-    poolName: ebwebGroup2023
++    password: 123456a@
++    poolName: ebwebGroup2024200Node1
+     hikari:
+       auto-commit: false
+       data-source-properties:
+@@ -158,10 +158,10 @@ spring:
+         hibernate.id.new_generator_mappings: true
+   datasourceReportGroup2:
+     type: com.zaxxer.hikari.HikariDataSource
+-    url: jdbc:sqlserver://10.100.122.191:1433;database=EB99_GR2;ApplicationIntent=READONLY
++    url: jdbc:sqlserver://10.100.122.166:1433;database=EB99_GR2
+     username: sa
+-    password: EaSYBoOK@Sds((2024
+-    poolName: ebwebGroup2024
++    password: 123456a@
++    poolName: ebwebGroup2024200Node1
+     hikari:
+       auto-commit: false
+       data-source-properties:

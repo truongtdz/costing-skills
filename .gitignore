@@ -1,0 +1,9 @@
+# Bỏ qua tất cả, chỉ track các thư mục cần push
+/*
+!/.gitignore
+!/agents/
+!/skills/
+!/work/
+
+# Cấu hình cá nhân, không push
+settings.local.json

@@ -1,0 +1,633 @@
+diff --git a/COSTING.md b/COSTING.md
+index d1865b3..b287062 100644
+--- a/COSTING.md
++++ b/COSTING.md
+@@ -104,13 +104,40 @@ Không gửi thành tiền: `ebqueue` vốn đã phải đọc DB để lấy `M
+ 
+ Bên nhận dùng Jackson 2, bên này Jackson 3. Thêm hoặc đổi tên trường phải kiểm cả hai đầu.
+ 
+-## 8. Chia lô kết quả — con số có ràng buộc
++Record `CostingResult` trong bộ nhớ có thêm trường thứ tư `referenceID` (dùng cho mục 8b), đánh `@JsonIgnore` nên JSON vẫn đúng ba trường (đã kiểm bằng `JacksonJsonMessageConverter` ngày 16/10/2026). Bỏ `@JsonIgnore` là gửi `ReferenceID` sang `ebqueue`, đổi hợp đồng. `UT_078` chặn việc này: serialize bản tin bằng đúng bean `rabbitJsonMessageConverter()` và kiểm mỗi phần tử `data` có đúng ba trường (bỏ `@JsonIgnore` thì test đỏ — test-writer kiểm bằng cài lỗi 16/10/2026).
+ 
+-`application-worker.yml` → `result-batch-size: 2000`.
++## 8. Chia lô kết quả — không cắt ngang chứng từ cha, con số có ràng buộc
++
++### 8a. Kích thước lô
++
++`application-worker.yml` → `result-batch-size`. Hiện đặt **200** để thử nghiệm sau đợt đo khoá bảng 15/10/2026 (trước đó 2000); người dùng **chưa chốt** giá trị lâu dài.
+ 
+ Mỗi bản tin là **một transaction** bên `ebqueue`. MSSQL leo thang lên **khoá toàn bảng** khi một câu lệnh chạm từ 5.000 khoá trên cùng một bảng. `RepositoryLedger` ~1 dòng mỗi `detailID`, `GeneralLedger` có thể gấp đôi.
+ 
+-**Nâng con số này lên gần hoặc quá 5.000 sẽ khoá bảng `RepositoryLedger` của cả database**, chặn mọi thao tác ghi sổ kho của mọi công ty. Đổi thì phải đo lại tỉ lệ dòng trên mỗi `detailID` trước.
++**Nâng con số này lên gần hoặc quá 5.000 sẽ khoá bảng `RepositoryLedger` của cả database**, chặn mọi thao tác ghi sổ kho của mọi công ty. Đổi thì phải đo lại tỉ lệ dòng trên mỗi `detailID` trước. Triệu chứng thật (DB test EB99_GR2, 15/10/2026, lô 1.000, 1 consumer): 100 lần đọc cách 5 giây thấy `ebqueue` giữ khoá X cấp bảng trên `RepositoryLedger` 61 lần, `GeneralLedger` 54, `GeneralLedgerDetail` 46, `RSInwardOutward` 21; 10 phiên khác chờ `LCK_M_IX` tới 6,5 giây.
++
++### 8b. Một chứng từ cha chỉ nằm trong một lô (chốt 16/10/2026)
++
++Mọi kết quả cùng **`ReferenceID` của dòng sổ kho** phải đi chung **một** bản tin. Chia lô theo nhóm `ReferenceID`, không theo vị trí trong danh sách. Nghĩa của `ReferenceID` theo loại dòng:
++
++| TypeID | `ReferenceID` | Quan hệ với chứng từ nghiệp vụ |
++|---|---|---|
++| 411 | Phiếu kho của hoá đơn (`SAInvoice.RSInwardOutwardID`) | 1-1 |
++| 403 | Phiếu kho của chứng từ hàng bán trả lại | 1-1 (người dùng xác nhận) |
++| 410, 412, 414, 415 | Chính phiếu kho | — |
++| 420, 421, 422 | `RSTransfer.ID` | — |
++
++Nhóm `ReferenceID` có nhiều dòng hơn `result-batch-size` thì lô chứa nó **được phép vượt** kích thước, **không cắt** chứng từ. Quyết định của người dùng ("trước mắt cho lô đó được hơn so với quy định"). Hệ quả: lô vượt cỡ có thể chạm ngưỡng leo thang khoá ở 8a — chấp nhận tạm thời.
++
++Vì sao: `ebqueue` chạy **nhiều consumer song song** (mục 5 bên đó) và store `update_InventoryCosting_TVP` cộng lại tổng tiền header bằng `SUM` trên dòng chi tiết của chứng từ. Hai lô cùng chạm một chứng từ cha thì tranh khoá trên header và chi tiết của nó. Ngược lại, khi mọi dòng được tính giá của một chứng từ nằm cùng một lô thì không lô nào khác sửa chứng từ đó, `SUM` của lô ấy ra đúng tổng cuối, kể cả khi chỉ tính giá một phần vật tư của chứng từ.
++
++Vi phạm thì: deadlock trong store, một lô bị chọn làm nạn nhân, rollback, TaskLog chuyển lỗi. Triệu chứng thật (EB99_GR2, 15/10/2026 19:09, lô 1.000, 5 consumer, chia theo vị trí): "Transaction (Process ID 773/822) was deadlocked ... chosen as the deadlock victim" ở lô 116/370, TaskLog 886029 chuyển Fail. Deadlock graph không còn trong `system_health` nên tài nguyên tranh chấp **chưa chứng minh**; header chứng từ cha là nghi vấn mạnh nhất.
++
++Hợp đồng ba trường ở mục 7 **không đổi**: `ReferenceID` chỉ dùng để chia lô bên này, không gửi sang `ebqueue`.
++
++Cách chia (`CostingResultSenderServiceImpl.splitByParentDocument`): gom kết quả theo `ReferenceID` theo thứ tự chứng từ xuất hiện lần đầu, rồi xếp lần lượt từng chứng từ vào lô; thêm chứng từ kế tiếp mà lô vượt `result-batch-size` thì mở lô mới. Lô chỉ vượt cỡ khi tự một chứng từ đã lớn hơn cỡ lô. Dòng kết quả **không có `ReferenceID`** được coi là một chứng từ riêng — không có căn cứ để gom (chưa kiểm DWH có dòng phát sinh nào thiếu `ReferenceID` hay không). Kỳ không ra dòng nào vẫn gửi một bản tin rỗng, `batchTotal = 1`, để `ebqueue` đủ số lô mà đóng TaskLog. `batchTotal` là số bản tin thật đã chia, `ebqueue` đóng TaskLog khi đủ số lô này (mục 5b `COSTING.md` của `ebqueue`).
++
++Lệnh lắp ráp, tháo dỡ (kiểm trên EB99_GR2 ngày 16/10/2026): store còn cộng `SUM` trên `RSAssemblyDismantlement` và phiếu nhập thành phẩm (404); chia theo `ReferenceID` của dòng 414 chỉ bảo vệ được lệnh nếu mỗi lệnh có đúng một phiếu xuất nguyên vật liệu. Dữ liệu thật: **0** lệnh có hơn một phiếu xuất, **0** phiếu kho gắn với hơn một hoá đơn; mẫu 20.000 dòng 411 và 420/421/422 khớp 100% nghĩa `ReferenceID` ở bảng trên. Đây là kiểm dữ liệu, không phải ràng buộc DB: nếu nghiệp vụ sau này cho một lệnh nhiều phiếu xuất thì hai lô có thể cùng chạm một lệnh lắp ráp và quay lại nguy cơ deadlock.
+ 
+ ## 9. GUID phải đảo byte ở biên
+ 
+@@ -145,7 +172,7 @@ Khi `byRepository = true` hoặc `null`, chuyển kho **giữ nguyên cách cũ*
+ 
+ ## 11. Bộ test tự động là định nghĩa của "đúng"
+ 
+-72 test, chạy `./mvnw test` mất vài giây (phải dùng JDK 21). Không cần MSSQL, RabbitMQ, ClickHouse hay mạng — client và service phụ thuộc được giả lập, không dựng Spring context.
++78 test, chạy `./mvnw test` mất vài giây (phải dùng JDK 21). Không cần MSSQL, RabbitMQ, ClickHouse hay mạng — client và service phụ thuộc được giả lập, không dựng Spring context.
+ 
+ | File | Phủ |
+ |---|---|
+@@ -164,6 +191,7 @@ Mỗi test mang một mã `UT_xxx` trong `@DisplayName`, không trùng nhau gi
+ | `UT_043` – `UT_052` | `CostingResultSenderServiceImplTest` |
+ | `UT_053` – `UT_067` | `CostingQueueListenerTest` |
+ | `UT_068` – `UT_072` | `CostingServiceImplTest` |
++| `UT_073` – `UT_078` | `CostingResultSenderServiceImplTest` |
+ 
+ | Mục | Test |
+ |---|---|
+@@ -174,12 +202,13 @@ Mỗi test mang một mã `UT_xxx` trong `@DisplayName`, không trùng nhau gi
+ | 5 Hàng bán trả lại — khoá ghép | `UT_019`, `UT_020` |
+ | 5 Hàng bán trả lại — cây quyết định | `UT_013` – `UT_016`, `UT_021` – `UT_027`, `UT_040`, `UT_041` |
+ | 6 Không làm tròn | `UT_009` |
+-| 7 Hợp đồng với `ebqueue` | `UT_042`, `UT_051`, `UT_052` |
+-| 8 Chia lô | `UT_043` – `UT_048` |
++| 7 Hợp đồng với `ebqueue` | `UT_042`, `UT_051`, `UT_052`; JSON đúng ba trường: `UT_078` |
++| 8a Chia lô theo cỡ | `UT_043` – `UT_048` |
++| 8b Không cắt chứng từ cha | `UT_073` – `UT_075`; `batchTotal` đúng số bản tin: `UT_076`; dòng không có `ReferenceID` là chứng từ riêng: `UT_077` |
+ | 10 `byRepository` | `UT_028` – `UT_031`, `UT_054`, `UT_055` |
+ | 10a Gộp kho bỏ chuyển kho | `UT_068` – `UT_070`; điều kiện "chỉ khi gộp kho": `UT_071`, `UT_072` |
+ 
+-Bảng trên đã được kiểm bằng cách **cố ý cài lỗi** vào code, mỗi lần một chỗ: 17 lỗi (13/10/2026) đều làm ít nhất một test đỏ. Mục 10a (15/10/2026): `UT_068` – `UT_070` đỏ trên code trước bản sửa; xoá vế `!byRepository` của nhánh chuyển kho thì `UT_071`, `UT_072` đỏ. Một test "phủ" một mục chỉ khi phá đúng bất biến của mục đó thì test đỏ. Thêm test mới mà cài lỗi tương ứng vẫn xanh thì test đó chưa phủ gì.
++Bảng trên đã được kiểm bằng cách **cố ý cài lỗi** vào code, mỗi lần một chỗ: 17 lỗi (13/10/2026) đều làm ít nhất một test đỏ. Mục 10a (15/10/2026): `UT_068` – `UT_070` đỏ trên code trước bản sửa; xoá vế `!byRepository` của nhánh chuyển kho thì `UT_071`, `UT_072` đỏ. Mục 8b (16/10/2026): `UT_073` – `UT_075` đỏ trên code chia theo vị trí; truyền `null` thay `ReferenceID` vào `CostingResult` thì ba test này đỏ; bỏ điều kiện mở lô mới (dồn mọi chứng từ vào một lô) thì `UT_073` và các test 8a đỏ. `UT_076` là test chặn, xanh cả trước bản sửa, chưa kiểm bằng cài lỗi. `UT_077`, `UT_078` (test chặn, test-writer kiểm bằng cài lỗi 16/10/2026): gom mọi dòng không có `ReferenceID` thành một chứng từ thì `UT_077` (và `UT_043` – `UT_047`, `UT_051`) đỏ; bỏ `@JsonIgnore` ở `CostingResult.referenceID` thì `UT_078` đỏ. Một test "phủ" một mục chỉ khi phá đúng bất biến của mục đó thì test đỏ. Thêm test mới mà cài lỗi tương ứng vẫn xanh thì test đó chưa phủ gì.
+ 
+ Chưa có test cho `AutoOWAmountCal` NULL (mục 5, lệch đã biết) vì nghiệp vụ chưa chốt.
+ 
+diff --git a/src/main/java/vn/softdreams/ebinventory/config/ApplicationProperties.java b/src/main/java/vn/softdreams/ebinventory/config/ApplicationProperties.java
+index b7213e5..81ee28a 100644
+--- a/src/main/java/vn/softdreams/ebinventory/config/ApplicationProperties.java
++++ b/src/main/java/vn/softdreams/ebinventory/config/ApplicationProperties.java
+@@ -50,6 +50,6 @@ public class ApplicationProperties {
+         private String costingResult;
+ 
+         /** Số dòng kết quả mỗi bản tin gửi sang ebqueue, giữ dưới ngưỡng leo thang khoá của MSSQL */
+-        private int resultBatchSize = 2000;
++        private int resultBatchSize = 200;
+     }
+ }
+diff --git a/src/main/java/vn/softdreams/ebinventory/domain/dto/CostingResult.java b/src/main/java/vn/softdreams/ebinventory/domain/dto/CostingResult.java
+index 9c871e2..90b2659 100644
+--- a/src/main/java/vn/softdreams/ebinventory/domain/dto/CostingResult.java
++++ b/src/main/java/vn/softdreams/ebinventory/domain/dto/CostingResult.java
+@@ -1,17 +1,31 @@
+ package vn.softdreams.ebinventory.domain.dto;
+ 
++import com.fasterxml.jackson.annotation.JsonIgnore;
++
+ import java.math.BigDecimal;
+ 
+ /**
+  * Kết quả tính giá của một dòng chứng từ, bắn sang ebqueue để update ngược lại DB.
+  * Không kèm thành tiền vì ebqueue vốn đã phải đọc DB để lấy MainConvertRate và Formula,
+  * nên tự nhân với số lượng rồi làm tròn theo cấu hình của công ty.
++ * referenceID chỉ dùng để chia lô bên này (mọi dòng cùng chứng từ cha đi chung một lô), không đưa vào JSON
++ * nên hợp đồng với ebqueue vẫn đúng ba trường.
+  * @param detailID      : dòng chi tiết chứng từ cần update
+  * @param typeID        : loại dòng sổ kho, ebqueue dựa vào đây để biết update bảng và cột nào
+  * @param mainUnitPrice : đơn giá bình quân theo đơn vị chính, chưa làm tròn theo cấu hình công ty
++ * @param referenceID   : ReferenceID của dòng sổ kho, xác định chứng từ cha; null nếu không biết
+  */
+ public record CostingResult(
+     String detailID,
+     int typeID,
+-    BigDecimal mainUnitPrice
+-) {}
++    BigDecimal mainUnitPrice,
++    @JsonIgnore String referenceID
++) {
++
++    /**
++     * Kết quả không biết chứng từ cha, khi chia lô mỗi dòng được coi là một chứng từ riêng.
++     */
++    public CostingResult(String detailID, int typeID, BigDecimal mainUnitPrice) {
++        this(detailID, typeID, mainUnitPrice, null);
++    }
++}
+diff --git a/src/main/java/vn/softdreams/ebinventory/domain/dto/DwhRepositoryLedgerRow.java b/src/main/java/vn/softdreams/ebinventory/domain/dto/DwhRepositoryLedgerRow.java
+index 4a121a5..68b3243 100644
+--- a/src/main/java/vn/softdreams/ebinventory/domain/dto/DwhRepositoryLedgerRow.java
++++ b/src/main/java/vn/softdreams/ebinventory/domain/dto/DwhRepositoryLedgerRow.java
+@@ -9,7 +9,7 @@ import java.time.Instant;
+  * @param materialGoodsID : ID VTHH, một nửa khoá nghiệp vụ
+  * @param repositoryID    : ID kho, nửa còn lại của khoá nghiệp vụ
+  * @param detailID        : ID dòng chi tiết chứng từ, đường ghi giá vốn ngược lại
+- * @param referenceID     : ID chứng từ kho, dùng để ghép với chứng từ hàng bán trả lại
++ * @param referenceID     : ID chứng từ cha, dùng để ghép với chứng từ hàng bán trả lại và để chia lô kết quả
+  * @param typeID          : loại chứng từ, quyết định dòng tham gia công thức theo cách nào
+  * @param postedDate      : ngày hạch toán, dòng tồn đầu kỳ luôn là 1970-01-01
+  * @param mainIwQuantity  : số lượng nhập theo đơn vị chính, dòng tồn đầu kỳ là lượng tồn
+diff --git a/src/main/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultMessage.java b/src/main/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultMessage.java
+index 706008d..3b1e4b8 100644
+--- a/src/main/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultMessage.java
++++ b/src/main/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultMessage.java
+@@ -11,13 +11,13 @@ import java.util.List;
+  * @param event        : loại việc, đối chiếu với Constants.Event
+  * @param data         : danh sách dòng chứng từ kèm đơn giá bình quân của lô này
+  * @param batchIndex   : số thứ tự lô, bắt đầu từ 1
+- * @param batchTotal   : tổng số lô của cả kỳ
+- * @param messageFinal : true nếu là lô cuối, ebqueue dựa vào đây để đóng TaskLog
++ * @param batchTotal   : tổng số lô của cả kỳ, ebqueue đóng TaskLog khi đủ số lô này hoàn thành
++ * @param messageFinal : true nếu là lô gửi sau cùng; ebqueue chạy song song nên không dựa vào cờ này để đóng TaskLog
+  * @param companyID    : ID công ty, ebqueue dùng để lọc khi cập nhật sổ cái
+  * @param userName     : người thực hiện, dùng để tra vết
+  * @param groupName    : nhóm dữ liệu, ebqueue dùng để chọn datasource
+  * @param taskID       : tiến trình cha bên ebwebbe
+- * @param taskDetailID : tiến trình con tương ứng lệnh tính giá
++ * @param taskDetailID : chuyển tiếp từ lệnh tính giá; ebwebbe không còn tạo TaskLogDetail nên thường null
+  * @param errorMessage : null nếu tính giá thành công, có giá trị thì ebqueue đóng TaskLog trạng thái lỗi
+  */
+ public record CostingResultMessage(
+diff --git a/src/main/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultSenderService.java b/src/main/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultSenderService.java
+index 0410fd6..3897e4e 100644
+--- a/src/main/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultSenderService.java
++++ b/src/main/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultSenderService.java
+@@ -9,7 +9,7 @@ import java.util.List;
+  */
+ public interface CostingResultSenderService {
+     /**
+-     * Gửi toàn bộ kết quả của một kỳ tính giá, chia thành nhiều lô.
++     * Gửi toàn bộ kết quả của một kỳ tính giá, chia thành nhiều lô, không lô nào cắt ngang một chứng từ cha.
+      *
+      * @param results danh sách dòng chứng từ kèm đơn giá bình quân
+      * @param source  bản tin lệnh tính giá, chỉ lấy ngữ cảnh công ty, người dùng và tiến trình
+diff --git a/src/main/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultSenderServiceImpl.java b/src/main/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultSenderServiceImpl.java
+index 0426126..ce79f10 100644
+--- a/src/main/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultSenderServiceImpl.java
++++ b/src/main/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultSenderServiceImpl.java
+@@ -8,7 +8,10 @@ import vn.softdreams.ebinventory.config.ApplicationProperties;
+ import vn.softdreams.ebinventory.domain.dto.CostingResult;
+ import vn.softdreams.ebinventory.utils.Constants;
+ 
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ 
+ @Service
+ @Slf4j
+@@ -24,15 +27,16 @@ public class CostingResultSenderServiceImpl implements CostingResultSenderServic
+ 
+     @Override
+     public void sendCostingResult(List<CostingResult> results, CostingQueueMessage source) {
+-        int batchSize = queueProperties.getResultBatchSize();
+-        // Kỳ không ra dòng nào vẫn gửi một bản tin rỗng mang cờ messageFinal, để ebqueue đóng TaskLog
++        List<List<CostingResult>> batches = splitByParentDocument(results, queueProperties.getResultBatchSize());
++        // Kỳ không ra dòng nào vẫn gửi một bản tin rỗng (batchTotal = 1), để ebqueue đủ số lô mà đóng TaskLog
+         // thay vì để tiến trình treo mãi ở trạng thái đang xử lý
+-        int total = results.isEmpty() ? 1 : (results.size() + batchSize - 1) / batchSize;
++        if (batches.isEmpty()) {
++            batches.add(List.of());
++        }
++        int total = batches.size();
+ 
+         for (int index = 0; index < total; index++) {
+-            List<CostingResult> batch = results.isEmpty()
+-                ? List.of()
+-                : results.subList(index * batchSize, Math.min((index + 1) * batchSize, results.size()));
++            List<CostingResult> batch = batches.get(index);
+             boolean isFinal = index == total - 1;
+ 
+             CostingResultMessage message = new CostingResultMessage(
+@@ -88,4 +92,47 @@ public class CostingResultSenderServiceImpl implements CostingResultSenderServic
+             }
+         );
+     }
++
++    /**
++     * Chia kết quả thành lô sao cho mọi dòng cùng chứng từ cha (ReferenceID của dòng sổ kho) nằm chung một lô.
++     * ebqueue ghi các lô song song và store cộng lại tổng tiền header bằng SUM trên chi tiết, nên hai lô cùng
++     * chạm một chứng từ là tranh khoá, deadlock. Chứng từ có nhiều dòng hơn cỡ lô thì lô chứa nó được vượt cỡ,
++     * không cắt. Dòng không có ReferenceID được coi là một chứng từ riêng.
++     *
++     * @param results   danh sách kết quả, thứ tự các dòng cùng chứng từ có thể nằm rải rác
++     * @param batchSize số dòng tối đa của một lô, trừ lô chứa chứng từ lớn hơn cỡ lô
++     * @return danh sách lô theo thứ tự chứng từ xuất hiện lần đầu; rỗng nếu không có kết quả
++     */
++    private List<List<CostingResult>> splitByParentDocument(List<CostingResult> results, int batchSize) {
++        // Kết quả ra theo nhóm VTHH nên dòng của một chứng từ nằm rải rác, gom lại theo ReferenceID trước
++        Map<String, List<CostingResult>> documents = new LinkedHashMap<>();
++        List<List<CostingResult>> groups = new ArrayList<>();
++        for (CostingResult result : results) {
++            if (result.referenceID() == null) {
++                groups.add(List.of(result));
++                continue;
++            }
++            List<CostingResult> document = documents.get(result.referenceID());
++            if (document == null) {
++                document = new ArrayList<>();
++                documents.put(result.referenceID(), document);
++                groups.add(document);
++            }
++            document.add(result);
++        }
++
++        List<List<CostingResult>> batches = new ArrayList<>();
++        List<CostingResult> current = new ArrayList<>();
++        for (List<CostingResult> group : groups) {
++            if (!current.isEmpty() && current.size() + group.size() > batchSize) {
++                batches.add(current);
++                current = new ArrayList<>();
++            }
++            current.addAll(group);
++        }
++        if (!current.isEmpty()) {
++            batches.add(current);
++        }
++        return batches;
++    }
+ }
+diff --git a/src/main/java/vn/softdreams/ebinventory/service/impl/CostingServiceImpl.java b/src/main/java/vn/softdreams/ebinventory/service/impl/CostingServiceImpl.java
+index a9dde27..dcf5e73 100644
+--- a/src/main/java/vn/softdreams/ebinventory/service/impl/CostingServiceImpl.java
++++ b/src/main/java/vn/softdreams/ebinventory/service/impl/CostingServiceImpl.java
+@@ -196,7 +196,7 @@ public class CostingServiceImpl implements CostingService {
+ 
+         List<CostingResult> results = new ArrayList<>(pricedRows.size());
+         for (DwhRepositoryLedgerRow row: pricedRows) {
+-            results.add(new CostingResult(row.detailID(), row.typeID(), mainUnitPrice));
++            results.add(new CostingResult(row.detailID(), row.typeID(), mainUnitPrice, row.referenceID()));
+         }
+         return results;
+     }
+diff --git a/src/main/resources/config/application-worker.yml b/src/main/resources/config/application-worker.yml
+index 87022ba..d0efed4 100644
+--- a/src/main/resources/config/application-worker.yml
++++ b/src/main/resources/config/application-worker.yml
+@@ -45,4 +45,4 @@ application:
+     # Queue đẩy kết quả sang ebqueue, ebqueue là chủ sở hữu và tự khai báo
+     costing-result: queue_eb_inventory_costing_result
+     # Số dòng kết quả mỗi bản tin, một kỳ có thể ra hàng chục nghìn dòng
+-    result-batch-size: 2000
++    result-batch-size: 200
+diff --git a/src/test/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultSenderServiceImplTest.java b/src/test/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultSenderServiceImplTest.java
+index 6871fef..a804aac 100644
+--- a/src/test/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultSenderServiceImplTest.java
++++ b/src/test/java/vn/softdreams/ebinventory/rabbitmq/rabbitmqcosting/CostingResultSenderServiceImplTest.java
+@@ -13,19 +13,35 @@ import org.springframework.amqp.core.MessageDeliveryMode;
+ import org.springframework.amqp.core.MessagePostProcessor;
+ import org.springframework.amqp.core.MessageProperties;
+ import org.springframework.amqp.rabbit.core.RabbitTemplate;
++import org.springframework.amqp.support.converter.MessageConverter;
++import tools.jackson.databind.JsonNode;
++import tools.jackson.databind.ObjectMapper;
+ import vn.softdreams.ebinventory.config.ApplicationProperties;
++import vn.softdreams.ebinventory.config.clients.EbWebClient;
++import vn.softdreams.ebinventory.config.clients.GoGatewayClient;
+ import vn.softdreams.ebinventory.domain.dto.CostingResult;
++import vn.softdreams.ebinventory.domain.dto.DwhRepositoryLedgerRow;
++import vn.softdreams.ebinventory.domain.dto.SaReturnCostingInfo;
++import vn.softdreams.ebinventory.service.impl.CostingServiceImpl;
+ import vn.softdreams.ebinventory.utils.Constants;
+ 
+ import java.math.BigDecimal;
++import java.time.Instant;
++import java.time.LocalDateTime;
+ import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.List;
++import java.util.Map;
++import java.util.Set;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.atLeastOnce;
+ import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
+ 
+ /**
+  * Kiểm việc chia lô kết quả gửi sang ebqueue. Chia lô để mỗi giao dịch ghi dưới ngưỡng
+@@ -41,9 +57,28 @@ class CostingResultSenderServiceImplTest {
+     private static final long TASK_ID = 885342L;
+     private static final long TASK_DETAIL_ID = 10424537L;
+ 
++    /** Kỳ tính giá tháng 10/2026 theo định dạng chuỗi của bản tin lệnh tính giá */
++    private static final String PERIOD_FROM = "2026-10-01 00:00:00";
++    private static final String PERIOD_TO = "2026-10-31 23:59:59";
++    private static final int FINANCIAL_LEDGER = 0;
++    private static final Instant POSTED_DATE = Instant.parse("2026-10-15T00:00:00Z");
++    private static final Instant OPENING_STOCK_DATE = Instant.parse("1970-01-01T00:00:00Z");
++    private static final LocalDateTime INVOICE_DATE_IN_PERIOD = LocalDateTime.of(2026, 10, 10, 0, 0);
++    private static final int AUTO_COST = 0;
++    private static final String MATERIAL_A = "VTHH-A";
++    private static final String MATERIAL_B = "VTHH-B";
++    private static final String REPOSITORY_1 = "KHO-1";
++    private static final String REPOSITORY_2 = "KHO-2";
++
+     @Mock
+     private RabbitTemplate rabbitTemplate;
+ 
++    @Mock
++    private GoGatewayClient goGatewayClient;
++
++    @Mock
++    private EbWebClient ebWebClient;
++
+     @Captor
+     private ArgumentCaptor<Object> sentMessageCaptor;
+ 
+@@ -173,8 +208,275 @@ class CostingResultSenderServiceImplTest {
+         assertThat(processed.getMessageProperties().getDeliveryMode()).isEqualTo(MessageDeliveryMode.PERSISTENT);
+     }
+ 
++    // ----- Chia lô theo chứng từ cha (COSTING.md mục 8b) -----
++    // Chạy cả chuỗi nhận lệnh, tính giá, gửi kết quả với dòng sổ kho thô có ReferenceID, chỉ giả lập
++    // hai client và RabbitTemplate, để test không phụ thuộc cách code mang ReferenceID tới chỗ chia lô.
++
++    /**
++     * Bốn hoá đơn bán (411), mỗi hoá đơn 3 dòng VTHH A và 3 dòng VTHH B, cỡ lô 10. Kết quả tính theo
++     * từng nhóm VTHH nên các dòng của một hoá đơn nằm rải ở hai đầu danh sách. Mục 8b: mọi dòng cùng
++     * ReferenceID phải đi chung một bản tin. Không chứng từ nào lớn hơn cỡ lô nên không bản tin nào
++     * được vượt 10 dòng (mục 8a, 8b).
++     */
++    @Test
++    @DisplayName("UT_073 Chia lô theo chứng từ cha: dòng của một hoá đơn nằm rải theo VTHH vẫn đi chung một lô")
++    void parentDocument_linesScatteredByMaterial_sentInOneBatch() {
++        List<DwhRepositoryLedgerRow> ledger = ledgerOfFourInvoicesWithTwoMaterials();
++
++        List<CostingResultMessage> messages = calculateAndSend(ledger, true);
++
++        assertEachResultSentOnce(messages, 24);
++        assertNoParentDocumentInTwoBatches(messages, ledger);
++        assertThat(messages).allSatisfy(
++            message -> assertThat(message.data()).as("Số dòng lô " + message.batchIndex()).hasSizeLessThanOrEqualTo(BATCH_SIZE)
++        );
++    }
++
++    /**
++     * Phiếu xuất kho (410, ReferenceID là chính phiếu kho) có 25 dòng, cỡ lô 10, kèm một phiếu 3 dòng.
++     * Mục 8b: chứng từ lớn hơn cỡ lô thì lô chứa nó được vượt cỡ, không cắt chứng từ, nên cả 25 dòng
++     * phải nằm trong một bản tin. Bản tin nào vượt cỡ phải là vì chứa chứng từ lớn hơn cỡ lô.
++     */
++    @Test
++    @DisplayName("UT_074 Chứng từ cha lớn hơn cỡ lô: lô được vượt cỡ, không cắt chứng từ")
++    void parentDocumentLargerThanBatchSize_notCut() {
++        List<DwhRepositoryLedgerRow> ledger = new ArrayList<>();
++        ledger.add(opening(MATERIAL_A, REPOSITORY_1, 100, 2_000_000));
++        for (int i = 1; i <= 25; i++) {
++            ledger.add(outwardLine(Constants.Type.XUAT_KHO, "PX1-" + i, "PX-1", MATERIAL_A, REPOSITORY_1, 1));
++        }
++        for (int i = 1; i <= 3; i++) {
++            ledger.add(outwardLine(Constants.Type.XUAT_KHO, "PX2-" + i, "PX-2", MATERIAL_A, REPOSITORY_1, 1));
++        }
++
++        List<CostingResultMessage> messages = calculateAndSend(ledger, true);
++
++        assertEachResultSentOnce(messages, 28);
++        assertNoParentDocumentInTwoBatches(messages, ledger);
++        assertThat(messages)
++            .filteredOn(message -> message.data().stream().anyMatch(row -> row.detailID().startsWith("PX1-")))
++            .singleElement()
++            .satisfies(message -> assertThat(message.data()).filteredOn(row -> row.detailID().startsWith("PX1-")).hasSize(25));
++        assertOversizedBatchOnlyForOversizedDocument(messages, ledger);
++    }
++
++    /**
++     * Chuyển kho (420, ReferenceID là RSTransfer.ID) và hàng bán trả lại (403, ReferenceID là phiếu kho
++     * của chứng từ trả lại, hoá đơn gốc trong kỳ nên dòng trả lại được gán giá), mỗi chứng từ 3 dòng
++     * VTHH A và 3 dòng VTHH B, cỡ lô 10. Mục 8b áp cho mọi TypeID được tính giá, không riêng 411.
++     */
++    @Test
++    @DisplayName("UT_075 Chia lô theo chứng từ cha: chuyển kho và hàng bán trả lại cũng không bị cắt")
++    void transferAndSalesReturn_notCutAcrossBatches() {
++        List<DwhRepositoryLedgerRow> ledger = new ArrayList<>();
++        List<SaReturnCostingInfo> returns = new ArrayList<>();
++        for (String material : List.of(MATERIAL_A, MATERIAL_B)) {
++            ledger.add(opening(material, REPOSITORY_1, 100, 2_000_000));
++            for (int i = 1; i <= 3; i++) {
++                ledger.add(outwardLine(Constants.Type.CHUYEN_KHO, "CK1-" + material + "-" + i, "CK-1", material, REPOSITORY_1, 1));
++            }
++            for (int i = 1; i <= 3; i++) {
++                String detailID = "TL1-" + material + "-" + i;
++                ledger.add(inwardLine(Constants.Type.NHAP_KHO_TU_BAN_HANG_TRA_LAI, detailID, "TL-1", material, REPOSITORY_1, 1, 0));
++                returns.add(returnInPeriod(detailID));
++            }
++            // Dòng nhập ở kho đến của cùng chứng từ chuyển kho, không được gán giá
++            for (int i = 1; i <= 3; i++) {
++                ledger.add(inwardLine(Constants.Type.CHUYEN_KHO, "CK1-" + material + "-" + i, "CK-1", material, REPOSITORY_2, 1, 0));
++            }
++        }
++        when(ebWebClient.getSaReturnCostingInfo(any())).thenReturn(returns);
++
++        List<CostingResultMessage> messages = calculateAndSend(ledger, true);
++
++        assertEachResultSentOnce(messages, 12);
++        assertNoParentDocumentInTwoBatches(messages, ledger);
++    }
++
++    /**
++     * Sau khi chia theo chứng từ, số thứ tự lô vẫn chạy liền từ 1 và mọi bản tin mang cùng batchTotal
++     * bằng đúng số bản tin đã gửi. ebqueue đóng TaskLog khi đủ batchTotal lô (mục 5b COSTING.md ebqueue),
++     * batchTotal lệch số bản tin thật là đóng sớm hoặc treo mãi.
++     */
++    @Test
++    @DisplayName("UT_076 Chia lô theo chứng từ cha: batchTotal bằng đúng số bản tin, số lô chạy liền từ 1")
++    void parentDocumentBatching_batchTotalMatchesMessageCount() {
++        List<CostingResultMessage> messages = calculateAndSend(ledgerOfFourInvoicesWithTwoMaterials(), true);
++
++        List<Integer> expectedIndexes = new ArrayList<>();
++        for (int i = 1; i <= messages.size(); i++) {
++            expectedIndexes.add(i);
++        }
++        assertThat(messages).extracting(CostingResultMessage::batchIndex).containsExactlyElementsOf(expectedIndexes);
++        assertThat(messages).extracting(CostingResultMessage::batchTotal).containsOnly(messages.size());
++    }
++
++    /**
++     * Mục 8b: dòng kết quả không có ReferenceID được coi là một chứng từ riêng. Hoá đơn HD-1 có 4 dòng
++     * VTHH A và 4 dòng VTHH B, kèm 6 dòng mỗi VTHH không có ReferenceID, cỡ lô 10. HD-1 phải đi chung một
++     * bản tin; các dòng không có ReferenceID không được gom chung thành một chứng từ (gom chung thì 12 dòng
++     * thành một chứng từ lớn hơn cỡ lô và lô chứa nó vượt 10 dòng), nên không bản tin nào vượt cỡ.
++     */
++    @Test
++    @DisplayName("UT_077 Dòng không có ReferenceID: mỗi dòng là một chứng từ riêng, không gom chung")
++    void resultWithoutReferenceID_treatedAsOwnDocument() {
++        List<DwhRepositoryLedgerRow> ledger = new ArrayList<>();
++        for (String material : List.of(MATERIAL_A, MATERIAL_B)) {
++            ledger.add(opening(material, REPOSITORY_1, 100, 2_000_000));
++            for (int i = 1; i <= 4; i++) {
++                ledger.add(outwardLine(Constants.Type.XUAT_KHO_TU_BAN_HANG, "HD1-" + material + "-" + i, "HD-1", material, REPOSITORY_1, 1));
++            }
++            for (int i = 1; i <= 6; i++) {
++                ledger.add(outwardLine(Constants.Type.XUAT_KHO, "KR-" + material + "-" + i, null, material, REPOSITORY_1, 1));
++            }
++        }
++
++        List<CostingResultMessage> messages = calculateAndSend(ledger, true);
++
++        assertEachResultSentOnce(messages, 20);
++        assertThat(messages)
++            .filteredOn(message -> message.data().stream().anyMatch(row -> row.detailID().startsWith("HD1-")))
++            .singleElement()
++            .satisfies(message -> assertThat(message.data()).filteredOn(row -> row.detailID().startsWith("HD1-")).hasSize(8));
++        assertThat(messages).allSatisfy(
++            message -> assertThat(message.data()).as("Số dòng lô " + message.batchIndex()).hasSizeLessThanOrEqualTo(BATCH_SIZE)
++        );
++    }
++
++    /**
++     * Mục 7: mỗi phần tử data trong JSON gửi sang ebqueue đúng ba trường detailID, typeID, mainUnitPrice.
++     * CostingResult trong bộ nhớ mang thêm referenceID để chia lô (mục 8b) nhưng không được lọt vào JSON.
++     * Serialize bằng đúng converter của ứng dụng (RabbitMqCostingConfig.rabbitJsonMessageConverter).
++     */
++    @Test
++    @DisplayName("UT_078 Hợp đồng JSON với ebqueue: phần tử data đúng ba trường, không có referenceID")
++    void resultJson_hasExactlyThreeFields_noReferenceID() {
++        List<CostingResultMessage> messages = calculateAndSend(ledgerOfFourInvoicesWithTwoMaterials(), true);
++        MessageConverter converter = new RabbitMqCostingConfig(new ApplicationProperties()).rabbitJsonMessageConverter();
++        ObjectMapper mapper = new ObjectMapper();
++
++        // Kết quả trong bộ nhớ có referenceID, nếu không test này không chứng minh được gì
++        assertThat(messages.get(0).data()).isNotEmpty().allSatisfy(row -> assertThat(row.referenceID()).isNotNull());
++        for (CostingResultMessage message : messages) {
++            JsonNode data = mapper.readTree(converter.toMessage(message, new MessageProperties()).getBody()).get("data");
++            assertThat(data).as("data lô " + message.batchIndex()).isNotNull().hasSize(message.data().size());
++            data.forEach(row -> assertThat(row.properties()).extracting(Map.Entry::getKey)
++                .as("Trường JSON của một dòng kết quả, lô " + message.batchIndex())
++                .containsExactlyInAnyOrder("detailID", "typeID", "mainUnitPrice"));
++        }
++    }
++
+     // ----- Trợ giúp -----
+ 
++    /** Bốn hoá đơn bán HD-1..HD-4, mỗi hoá đơn 3 dòng VTHH A và 3 dòng VTHH B, xếp theo VTHH như gogateway trả về. */
++    private List<DwhRepositoryLedgerRow> ledgerOfFourInvoicesWithTwoMaterials() {
++        List<DwhRepositoryLedgerRow> ledger = new ArrayList<>();
++        for (String material : List.of(MATERIAL_A, MATERIAL_B)) {
++            ledger.add(opening(material, REPOSITORY_1, 100, 2_000_000));
++            for (int invoice = 1; invoice <= 4; invoice++) {
++                for (int line = 1; line <= 3; line++) {
++                    ledger.add(outwardLine(
++                        Constants.Type.XUAT_KHO_TU_BAN_HANG, "HD" + invoice + "-" + material + "-" + line, "HD-" + invoice,
++                        material, REPOSITORY_1, 1
++                    ));
++                }
++            }
++        }
++        return ledger;
++    }
++
++    /** Chạy listener với service tính giá thật và service gửi thật, trả về mọi bản tin đã gửi theo thứ tự. */
++    private List<CostingResultMessage> calculateAndSend(List<DwhRepositoryLedgerRow> ledger, Boolean byRepository) {
++        when(goGatewayClient.getRepositoryLedger(any())).thenReturn(ledger);
++        CostingQueueListener listener = new CostingQueueListener(new CostingServiceImpl(goGatewayClient, ebWebClient), service);
++
++        listener.onCostingRequest(new CostingQueueMessage(
++            Constants.Event.CALCULATE_OW_PRICE,
++            new CostingQueueData(FINANCIAL_LEDGER, PERIOD_FROM, PERIOD_TO, List.of(), List.of(), byRepository),
++            COMPANY_ID, "nguoidung", "nhom", TASK_ID, TASK_DETAIL_ID
++        ));
++
++        verify(rabbitTemplate, atLeastOnce()).convertAndSend(eq(QUEUE_NAME), sentMessageCaptor.capture(), any(MessagePostProcessor.class));
++        return sentMessageCaptor.getAllValues().stream().map(CostingResultMessage.class::cast).toList();
++    }
++
++    /** Mọi dòng kết quả được gửi đúng một lần, không mất, không lặp. */
++    private void assertEachResultSentOnce(List<CostingResultMessage> messages, int expectedRowCount) {
++        List<String> sentDetailIDs = new ArrayList<>();
++        messages.forEach(message -> message.data().forEach(row -> sentDetailIDs.add(row.detailID())));
++        assertThat(sentDetailIDs).hasSize(expectedRowCount).doesNotHaveDuplicates();
++    }
++
++    /** Không ReferenceID nào xuất hiện ở hai bản tin khác nhau. */
++    private void assertNoParentDocumentInTwoBatches(List<CostingResultMessage> messages, List<DwhRepositoryLedgerRow> ledger) {
++        Map<String, String> referenceByDetail = referenceByDetail(ledger);
++        Map<String, Set<Integer>> batchesByReference = new HashMap<>();
++        for (CostingResultMessage message : messages) {
++            for (CostingResult row : message.data()) {
++                batchesByReference
++                    .computeIfAbsent(referenceByDetail.get(row.detailID()), key -> new HashSet<>())
++                    .add(message.batchIndex());
++            }
++        }
++        assertThat(batchesByReference).allSatisfy(
++            (reference, batches) -> assertThat(batches).as("Các lô chứa chứng từ cha " + reference).hasSize(1)
++        );
++    }
++
++    /** Bản tin vượt cỡ lô thì phải chứa ít nhất một chứng từ cha có số dòng kết quả lớn hơn cỡ lô. */
++    private void assertOversizedBatchOnlyForOversizedDocument(List<CostingResultMessage> messages, List<DwhRepositoryLedgerRow> ledger) {
++        Map<String, String> referenceByDetail = referenceByDetail(ledger);
++        Map<String, Integer> resultCountByReference = new HashMap<>();
++        messages.forEach(message -> message.data().forEach(
++            row -> resultCountByReference.merge(referenceByDetail.get(row.detailID()), 1, Integer::sum)
++        ));
++        assertThat(messages)
++            .filteredOn(message -> message.data().size() > BATCH_SIZE)
++            .allSatisfy(message -> assertThat(message.data())
++                .as("Lô " + message.batchIndex() + " vượt cỡ phải chứa chứng từ lớn hơn cỡ lô")
++                .anyMatch(row -> resultCountByReference.get(referenceByDetail.get(row.detailID())) > BATCH_SIZE));
++    }
++
++    private Map<String, String> referenceByDetail(List<DwhRepositoryLedgerRow> ledger) {
++        Map<String, String> referenceByDetail = new HashMap<>();
++        ledger.stream()
++            .filter(row -> !row.isOpeningStock())
++            .forEach(row -> referenceByDetail.put(row.detailID(), row.referenceID()));
++        return referenceByDetail;
++    }
++
++    private DwhRepositoryLedgerRow opening(String material, String repository, long quantity, long amount) {
++        return new DwhRepositoryLedgerRow(
++            true, material, repository, null, null, 0, OPENING_STOCK_DATE,
++            BigDecimal.valueOf(quantity), BigDecimal.ZERO, BigDecimal.valueOf(amount), BigDecimal.ZERO
++        );
++    }
++
++    private DwhRepositoryLedgerRow outwardLine(
++        int typeID, String detailID, String referenceID, String material, String repository, long quantity
++    ) {
++        return new DwhRepositoryLedgerRow(
++            false, material, repository, detailID, referenceID, typeID, POSTED_DATE,
++            BigDecimal.ZERO, BigDecimal.valueOf(quantity), BigDecimal.ZERO, BigDecimal.ZERO
++        );
++    }
++
++    private DwhRepositoryLedgerRow inwardLine(
++        int typeID, String detailID, String referenceID, String material, String repository, long quantity, long amount
++    ) {
++        return new DwhRepositoryLedgerRow(
++            false, material, repository, detailID, referenceID, typeID, POSTED_DATE,
++            BigDecimal.valueOf(quantity), BigDecimal.ZERO, BigDecimal.valueOf(amount), BigDecimal.ZERO
++        );
++    }
++
++    /** Hàng bán trả lại tự tính giá vốn, hoá đơn gốc trong kỳ: loại khỏi công thức nhưng vẫn được gán giá (mục 5). */
++    private SaReturnCostingInfo returnInPeriod(String detailID) {
++        return new SaReturnCostingInfo(
++            detailID, Constants.Type.HANG_BAN_TRA_LAI, AUTO_COST, "HD-GOC", "HDCT-GOC-" + detailID, INVOICE_DATE_IN_PERIOD
++        );
++    }
++
+     private List<CostingResult> results(int rowCount) {
+         List<CostingResult> rows = new ArrayList<>(rowCount);
+         for (int i = 1; i <= rowCount; i++) {
