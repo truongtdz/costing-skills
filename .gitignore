@@ -3,7 +3,6 @@
 !/.gitignore
 !/agents/
 !/skills/
-!/work/
 
 # Cấu hình cá nhân, không push
 settings.local.json
